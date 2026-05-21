@@ -20,6 +20,15 @@ class TurnstileController extends ChangeNotifier
   bool _isReady = false;
 
   bool _isDisposed = false;
+  bool _connectorReleased = false;
+  bool _hasConnector = false;
+
+  static const _jsHandlerNames = <String>[
+    'TurnstileToken',
+    'TurnstileError',
+    'TurnstileWidgetId',
+    'TokenExpired',
+  ];
 
   /// Retrives the current token from the widget.
   ///
@@ -49,6 +58,52 @@ class TurnstileController extends ChangeNotifier
   // ignore: use_setters_to_change_properties
   void setConnector(InAppWebViewController newConnector) {
     _connector = newConnector;
+    _hasConnector = true;
+  }
+
+  void _detachWebView() {
+    if (_connectorReleased || !_hasConnector) return;
+    _connectorReleased = true;
+    try {
+      for (final name in _jsHandlerNames) {
+        _connector.removeJavaScriptHandler(handlerName: name);
+      }
+    } on Object {
+      // Handler removal can fail if the native WebView is already gone.
+    }
+    try {
+      _connector.stopLoading();
+    } on Object {
+      // ignore
+    }
+  }
+
+  void _releaseConnector() {
+    _detachWebView();
+    if (!_hasConnector) return;
+    try {
+      _connector.dispose();
+    } on Object {
+      // ignore
+    }
+  }
+
+  /// Detaches handlers without disposing the native WebView.
+  ///
+  /// Used by headless Turnstile: [HeadlessInAppWebView.dispose] owns the
+  /// underlying [InAppWebViewController].
+  void detachWebView() {
+    _detachWebView();
+  }
+
+  /// Notifier cleanup when headless WebView already disposed the connector.
+  void disposeHeadlessCompanion() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    _onError = null;
+    _onTokenReceived = null;
+    detachWebView();
+    super.dispose();
   }
 
   /// Sets a new token.
@@ -116,7 +171,7 @@ class TurnstileController extends ChangeNotifier
   /// ```
   @override
   Future<void> refreshToken() async {
-    if (_isDisposed) return;
+    if (_isDisposed || _connectorReleased) return;
     _token = null;
     if (!_isReady || _error != null) {
       await _connector.reload();
@@ -161,9 +216,11 @@ class TurnstileController extends ChangeNotifier
   /// dispose resources
   @override
   void dispose() {
+    if (_isDisposed) return;
     _isDisposed = true;
     _onError = null;
     _onTokenReceived = null;
+    _releaseConnector();
     super.dispose();
   }
 

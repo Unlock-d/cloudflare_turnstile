@@ -19,6 +19,38 @@ const String _tokenExpiredJSHandler =
 const String _widgetCreatedJSHandler =
     'window.flutter_inappwebview.callHandler(`TurnstileWidgetId`, widgetId);';
 
+const _turnstileJsHandlerNames = <String>[
+  'TurnstileToken',
+  'TurnstileError',
+  'TurnstileWidgetId',
+  'TokenExpired',
+];
+
+void _removeTurnstileJsHandlers(InAppWebViewController controller) {
+  for (final name in _turnstileJsHandlerNames) {
+    try {
+      controller.removeJavaScriptHandler(handlerName: name);
+    } on Object {
+      // Native WebView may already be torn down.
+    }
+  }
+}
+
+void _disposeInAppWebViewController(InAppWebViewController? controller) {
+  if (controller == null) return;
+  _removeTurnstileJsHandlers(controller);
+  try {
+    controller.stopLoading();
+  } on Object {
+    // ignore
+  }
+  try {
+    controller.dispose();
+  } on Object {
+    // ignore
+  }
+}
+
 const String _source = """
 <!DOCTYPE html>
 <html lang="en">
@@ -403,6 +435,9 @@ class CloudflareTurnstile extends StatefulWidget
 class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
   final GlobalKey webViewKey = GlobalKey();
   late TurnstileTheme _resolvedTheme;
+  final InAppWebViewKeepAlive _keepAlive = InAppWebViewKeepAlive();
+  InAppWebViewController? _webViewController;
+  bool _disposed = false;
 
   final InAppWebViewSettings _settings = InAppWebViewSettings(
     /// Disbling caching for this webview instance
@@ -472,11 +507,12 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
   }
 
   void _createChannels(InAppWebViewController controller) {
+    _webViewController = controller;
     controller
       ..addJavaScriptHandler(
         handlerName: 'TurnstileToken',
         callback: (List<dynamic> args) {
-          if (!mounted) return;
+          if (_disposed || !mounted) return;
           final token = args[0] as String;
           widget.controller?.token = token;
           widget.onTokenReceived?.call(token);
@@ -485,7 +521,7 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
       ..addJavaScriptHandler(
         handlerName: 'TurnstileError',
         callback: (List<dynamic> args) {
-          if (_hasError != null) return;
+          if (_disposed || _hasError != null) return;
           final errorCode = int.tryParse(args[0] as String);
           _addError(TurnstileException.fromCode(errorCode ?? -1));
         },
@@ -493,7 +529,7 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
       ..addJavaScriptHandler(
         handlerName: 'TurnstileWidgetId',
         callback: (List<dynamic> args) {
-          if (!mounted) return;
+          if (_disposed || !mounted) return;
           widgetId = args[0] as String;
           widget.controller?.widgetId = widgetId;
           _isRendered = true;
@@ -503,7 +539,7 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
       ..addJavaScriptHandler(
         handlerName: 'TokenExpired',
         callback: (List<dynamic> message) {
-          if (!mounted) return;
+          if (_disposed || !mounted) return;
           widget.onTokenExpired?.call();
         },
       );
@@ -534,7 +570,7 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
   }
 
   late final _view = InAppWebView(
-    keepAlive: InAppWebViewKeepAlive(),
+    keepAlive: _keepAlive,
     key: webViewKey,
     initialData: InAppWebViewInitialData(
       data: data,
@@ -550,6 +586,7 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
       _resetWidget();
     },
     onLoadResource: (controller, resource) {
+      if (_disposed) return;
       if (_isTurnstileLoaded && _hasError != null) {
         controller.reload();
       }
@@ -578,6 +615,7 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
       return NavigationActionPolicy.CANCEL;
     },
     onLoadStop: (controller, uri) async {
+      if (_disposed || !mounted) return;
       if (!_isWidgetReady && !mounted) {
         final contentWidth = await controller.getContentWidth();
         if (contentWidth != null && contentWidth <= 0) {
@@ -595,7 +633,7 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
       _ready(true);
       _scriptLoadTimer?.cancel();
       _scriptLoadTimer = Timer(const Duration(milliseconds: 8000), () {
-        if (!mounted) return;
+        if (_disposed || !mounted) return;
         if (!_isRendered) {
           widget.onTimeout?.call();
         }
@@ -603,6 +641,7 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
     },
     onConsoleMessage: (controller, consoleMessage) {},
     onReceivedError: (controller, request, error) {
+      if (_disposed) return;
       if (request.isForMainFrame == false) {
         return;
       }
@@ -617,8 +656,17 @@ class _CloudflareTurnstileState extends State<CloudflareTurnstile> {
 
   @override
   void dispose() {
-    super.dispose();
+    _disposed = true;
     _scriptLoadTimer?.cancel();
+    _disposeInAppWebViewController(_webViewController);
+    _webViewController = null;
+    // State owns native WebView teardown; controller only clears notifier state.
+    widget.controller?.disposeHeadlessCompanion();
+    unawaited(InAppWebViewController.disposeKeepAlive(_keepAlive));
+    if (!Platform.isWindows) {
+      unawaited(InAppWebViewController.clearAllCache());
+    }
+    super.dispose();
   }
 
   @override
@@ -740,13 +788,22 @@ class _TurnstileInvisible extends CloudflareTurnstile {
   late HeadlessInAppWebView _view;
   Completer<dynamic>? _completer;
   bool _isRendered = false;
+  bool _disposed = false;
   Timer? _scriptLoadTimer;
+  Future<void> _serial = Future<void>.value();
+
+  Future<T> _runSerial<T>(Future<T> Function() action) {
+    final run = _serial.then((_) => action());
+    _serial = run.then((_) {}, onError: (_) {});
+    return run;
+  }
 
   void _createChannels(InAppWebViewController wController) {
     wController
       ..addJavaScriptHandler(
         handlerName: 'TurnstileToken',
         callback: (List<dynamic> args) {
+          if (_disposed) return;
           final token = args[0] as String;
           controller?.token = token;
           onTokenReceived?.call(token);
@@ -758,6 +815,7 @@ class _TurnstileInvisible extends CloudflareTurnstile {
       ..addJavaScriptHandler(
         handlerName: 'TurnstileError',
         callback: (List<dynamic> args) {
+          if (_disposed) return;
           final errorCode = int.tryParse(args[0] as String);
           final error = TurnstileException.fromCode(errorCode ?? -1);
 
@@ -769,6 +827,7 @@ class _TurnstileInvisible extends CloudflareTurnstile {
       ..addJavaScriptHandler(
         handlerName: 'TurnstileWidgetId',
         callback: (List<dynamic> args) {
+          if (_disposed) return;
           controller!.widgetId = args[0] as String;
           _isRendered = true;
           _scriptLoadTimer?.cancel();
@@ -777,7 +836,7 @@ class _TurnstileInvisible extends CloudflareTurnstile {
       ..addJavaScriptHandler(
         handlerName: 'TokenExpired',
         callback: (List<dynamic> message) {
-          // Handle token expiration logic here
+          if (_disposed) return;
           onTokenExpired?.call();
           if (!_completer!.isCompleted) {
             _completer?.complete(null);
@@ -788,24 +847,42 @@ class _TurnstileInvisible extends CloudflareTurnstile {
 
   @override
   Future<String?> getToken() async {
+    if (_disposed) {
+      throw StateError('CloudflareTurnstile has been disposed');
+    }
+    await _runSerial(_prepareTokenChallenge);
+    if (_disposed) return null;
+    return _completer!.future as Future<String?>;
+  }
+
+  /// Starts the challenge; token delivery is awaited outside the serial lock
+  /// so [dispose] can complete the completer without deadlocking.
+  Future<void> _prepareTokenChallenge() async {
     _completer = Completer<String?>();
 
     if (!_view.isRunning()) {
       await _view.run();
     }
+    if (_disposed) {
+      _completer?.complete(null);
+      return;
+    }
 
     if (token != null) {
       await controller!.refreshToken();
     }
+    if (_disposed) {
+      _completer?.complete(null);
+      return;
+    }
 
     _scriptLoadTimer?.cancel();
     _scriptLoadTimer = Timer(const Duration(milliseconds: 8000), () {
+      if (_disposed) return;
       if (!_isRendered) {
         onTimeout?.call();
       }
     });
-
-    return _completer!.future as Future<String?>;
   }
 
   @override
@@ -841,8 +918,27 @@ class _TurnstileInvisible extends CloudflareTurnstile {
   String? get token => controller?.token;
 
   @override
-  Future<void> dispose() async {
+  Future<void> dispose() {
+    return _runSerial(_disposeImpl);
+  }
+
+  Future<void> _disposeImpl() async {
+    if (_disposed) return;
+    _disposed = true;
     _scriptLoadTimer?.cancel();
-    await _view.dispose();
+    final pending = _completer;
+    if (pending != null && !pending.isCompleted) {
+      pending.complete(null);
+    }
+
+    controller?.detachWebView();
+    if (_view.isRunning()) {
+      await _view.dispose();
+    }
+    controller?.disposeHeadlessCompanion();
+
+    if (!Platform.isWindows) {
+      await InAppWebViewController.clearAllCache();
+    }
   }
 }
