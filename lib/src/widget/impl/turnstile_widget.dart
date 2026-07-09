@@ -790,6 +790,11 @@ class _TurnstileInvisible extends CloudflareTurnstile {
   bool _isRendered = false;
   bool _disposed = false;
   Timer? _scriptLoadTimer;
+  Timer? _tokenTimeoutTimer;
+
+  /// Upper bound for a single getToken(): long enough for a few automatic
+  /// `retry: auto` cycles (default interval 8s) to complete the challenge.
+  static const _tokenTimeout = Duration(seconds: 30);
   Future<void> _serial = Future<void>.value();
 
   Future<T> _runSerial<T>(Future<T> Function() action) {
@@ -807,6 +812,7 @@ class _TurnstileInvisible extends CloudflareTurnstile {
           final token = args[0] as String;
           controller?.token = token;
           onTokenReceived?.call(token);
+          _tokenTimeoutTimer?.cancel();
           if (!_completer!.isCompleted) {
             _completer?.complete(token);
           }
@@ -818,6 +824,16 @@ class _TurnstileInvisible extends CloudflareTurnstile {
           if (_disposed) return;
           final errorCode = int.tryParse(args[0] as String);
           final error = TurnstileException.fromCode(errorCode ?? -1);
+          controller?.error = error;
+
+          // Retryable failures (e.g. 600xxx challenge-execution / PAT warm-up
+          // on Android WebView) are expected transient errors: with
+          // `retry: auto` Turnstile keeps retrying the *same* challenge and
+          // will eventually deliver a token via the success callback. Surfacing
+          // them here would abort a challenge that is about to succeed — the
+          // root cause of the "fails a couple of times, then works" symptom.
+          // Only non-retryable errors terminate the pending getToken().
+          if (error.retryable) return;
 
           if (!_completer!.isCompleted) {
             _completer?.completeError(error);
@@ -883,6 +899,20 @@ class _TurnstileInvisible extends CloudflareTurnstile {
         onTimeout?.call();
       }
     });
+
+    // Overall guard: because retryable errors no longer abort the challenge,
+    // resolve the pending getToken() with null if no token arrives within the
+    // window (covers environments where Turnstile can never solve, e.g. some
+    // emulators) instead of hanging forever.
+    _tokenTimeoutTimer?.cancel();
+    _tokenTimeoutTimer = Timer(_tokenTimeout, () {
+      if (_disposed) return;
+      final pending = _completer;
+      if (pending != null && !pending.isCompleted) {
+        onTimeout?.call();
+        pending.complete(null);
+      }
+    });
   }
 
   @override
@@ -926,6 +956,7 @@ class _TurnstileInvisible extends CloudflareTurnstile {
     if (_disposed) return;
     _disposed = true;
     _scriptLoadTimer?.cancel();
+    _tokenTimeoutTimer?.cancel();
     final pending = _completer;
     if (pending != null && !pending.isCompleted) {
       pending.complete(null);
